@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WiFi Connect</string>
+    <string name="subtitle">Fast &amp; Secure Captive Portal Authentication</string>
+    <string name="current_wifi">Current Wi-Fi</string>
+    <string name="wifi_label">Wi-Fi:</string>
+    <string name="internet_label">Internet:</string>
+    <string name="portal_label">Portal:</string>
+    <string name="btn_connect">CONNECT</string>
+    <string name="btn_disconnect">DISCONNECT / LOGOUT</string>
+    <string name="auto_login_title">⚡ Auto-Connect on Wi-Fi</string>
+    <string name="auto_login_subtitle">Logs in automatically when Wi-Fi connects</string>
+    <string name="status_label">Status</string>
+    <string name="edit_credentials">Edit Credentials</string>
+    <string name="setup_credentials">Set Up Credentials</string>
+    <string name="open_portal">Open Portal in Browser</string>
+    <string name="refresh">Refresh Status</string>
+
+    <!-- Credentials dialog -->
+    <string name="credentials_title">Captive Portal Credentials</string>
+    <string name="credentials_security_badge">Secured with Android Keystore. Encrypted on your device only.</string>
+    <string name="username_hint">Username</string>
+    <string name="password_hint">Password</string>
+    <string name="password_helper_existing">Tap 👁 to view or edit saved password</string>
+    <string name="portal_url_hint">Portal Base URL (Optional)</string>
+    <string name="portal_url_auto_detected">⚡ Auto-detected: %1$s (Leave blank to adapt to any Wi-Fi)</string>
+    <string name="portal_url_auto_helper">Leave empty to auto-detect dynamically for each Wi-Fi</string>
+    <string name="save">Save</string>
+    <string name="cancel">Cancel</string>
+    <string name="clear">Clear</string>
+</resources>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#055BB5</color>
+    <color name="primary_variant">#023D7A</color>
+    <color name="on_primary">#FFFFFF</color>
+
+    <!-- Connect button green matching KL University captive portal -->
+    <color name="accent_green">#44AC33</color>
+    <color name="accent_green_hover">#55BD42</color>
+    <color name="on_accent_green">#FFFFFF</color>
+
+    <!-- Status indicator colors -->
+    <color name="status_green">#2E7D32</color>
+    <color name="status_green_bg">#E8F5E9</color>
+    <color name="status_orange">#E65100</color>
+    <color name="status_orange_bg">#FFF3E0</color>
+    <color name="status_red">#C62828</color>
+    <color name="status_red_bg">#FFEBEE</color>
+    <color name="status_blue">#0277BD</color>
+    <color name="status_blue_bg">#E1F5FE</color>
+    <color name="status_neutral">#5C5C5C</color>
+    <color name="status_neutral_bg">#F5F5F5</color>
+
+    <color name="background">#F4F6F9</color>
+    <color name="card_background">#FFFFFF</color>
+    <color name="card_stroke">#E2E8F0</color>
+    <color name="text_primary">#1A202C</color>
+    <color name="text_secondary">#718096</color>
+    <color name="divider">#EDF2F7</color>
+</resources>

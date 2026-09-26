@@ -1,0 +1,7 @@
+com.wificonnect.app-pngs-0 C:\Desktop\my workspace\android\app\build\generated\res\pngs\debug
+com.wificonnect.app-updated_navigation_xml-1 C:\Desktop\my workspace\android\app\build\generated\updated_navigation_xml\debug
+com.wificonnect.app-packageDebugResources-2 C:\Desktop\my workspace\android\app\build\intermediates\incremental\debug\packageDebugResources\merged.dir
+com.wificonnect.app-packageDebugResources-3 C:\Desktop\my workspace\android\app\build\intermediates\incremental\debug\packageDebugResources\stripped.dir
+com.wificonnect.app-debug-4 C:\Desktop\my workspace\android\app\build\intermediates\merged_res\debug\mergeDebugResources
+com.wificonnect.app-debug-5 C:\Desktop\my workspace\android\app\src\debug\res
+com.wificonnect.app-main-6 C:\Desktop\my workspace\android\app\src\main\res

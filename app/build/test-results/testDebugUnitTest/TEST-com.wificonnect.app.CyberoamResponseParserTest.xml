@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.wificonnect.app.CyberoamResponseParserTest" tests="9" skipped="0" failures="0" errors="0" timestamp="2026-09-26T11:04:18.594Z" hostname="PC-001" time="0.128">
+  <properties/>
+  <testcase name="testLoginLimitExceededResponse" classname="com.wificonnect.app.CyberoamResponseParserTest" time="0.081"/>
+  <testcase name="testEmptyResponse" classname="com.wificonnect.app.CyberoamResponseParserTest" time="0.001"/>
+  <testcase name="testConcurrentLoginExceededResponse" classname="com.wificonnect.app.CyberoamResponseParserTest" time="0.002"/>
+  <testcase name="testInvalidCredentialsResponse" classname="com.wificonnect.app.CyberoamResponseParserTest" time="0.005"/>
+  <testcase name="testSuccessfulLoginDefaultMessage" classname="com.wificonnect.app.CyberoamResponseParserTest" time="0.003"/>
+  <testcase name="testChallengeResponse" classname="com.wificonnect.app.CyberoamResponseParserTest" time="0.006"/>
+  <testcase name="testMalformedXmlResponse" classname="com.wificonnect.app.CyberoamResponseParserTest" time="0.018"/>
+  <testcase name="testSuccessfulLoginResponse" classname="com.wificonnect.app.CyberoamResponseParserTest" time="0.003"/>
+  <testcase name="testHtmlWebResponseFallbackToChallenge" classname="com.wificonnect.app.CyberoamResponseParserTest" time="0.002"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[[Fatal Error] :1:32: The element type "status" must be terminated by the matching end-tag "</status>".
+[Fatal Error] :1:10: DOCTYPE is disallowed when the feature "http://apache.org/xml/features/disallow-doctype-decl" set to true.
+]]></system-err>
+</testsuite>
