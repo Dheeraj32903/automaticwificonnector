@@ -14,7 +14,7 @@ import java.net.Inet4Address
 /**
  * Helper for inspecting Wi-Fi state, active Wi-Fi Network instance, SSID, and gateway IP.
  */
-class WifiManagerHelper(private val context: Context) {
+class WifiManagerHelper(private val context: Context) : WifiStateProvider {
 
     companion object {
         private const val TAG = "WifiManagerHelper"
@@ -31,7 +31,8 @@ class WifiManagerHelper(private val context: Context) {
     /**
      * Finds the active Wi-Fi Network object.
      */
-    fun getActiveWifiNetwork(): Network? {
+    @Suppress("DEPRECATION")
+    override fun getActiveWifiNetwork(): Network? {
         val activeNetwork = connectivityManager.activeNetwork ?: return null
         val caps = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return null
         if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
@@ -51,7 +52,7 @@ class WifiManagerHelper(private val context: Context) {
     /**
      * Checks whether the device is currently connected to Wi-Fi.
      */
-    fun isWifiConnected(): Boolean {
+    override fun isWifiConnected(): Boolean {
         val wifiNet = getActiveWifiNetwork() ?: return false
         val caps = connectivityManager.getNetworkCapabilities(wifiNet) ?: return false
         val connected = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
@@ -68,7 +69,7 @@ class WifiManagerHelper(private val context: Context) {
      * Gracefully handles Android 10+ "<unknown ssid>" when location permission is not granted.
      */
     @Suppress("DEPRECATION")
-    fun getWifiSsid(): String {
+    override fun getWifiSsid(): String {
         try {
             val wifiInfo: WifiInfo? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val wifiNet = getActiveWifiNetwork()
@@ -94,7 +95,7 @@ class WifiManagerHelper(private val context: Context) {
      * Retrieves the default gateway IPv4 address from LinkProperties of the Wi-Fi network.
      * On university networks, the Cyberoam/Sophos portal is typically at http://<gatewayIp>:8090.
      */
-    fun getGatewayIp(): String? {
+    override fun getGatewayIp(): String? {
         val wifiNet = getActiveWifiNetwork() ?: return null
         val linkProps: LinkProperties = connectivityManager.getLinkProperties(wifiNet) ?: return null
 
@@ -195,7 +196,7 @@ class WifiManagerHelper(private val context: Context) {
      * Binds the current application process to the active Wi-Fi network.
      * Prevents Android from routing captive portal DNS and HTTP requests through Mobile Data (Cellular).
      */
-    fun bindProcessToWifi(): Boolean {
+    override fun bindProcessToWifi(): Boolean {
         return try {
             val wifiNet = getActiveWifiNetwork() ?: return false
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -217,7 +218,7 @@ class WifiManagerHelper(private val context: Context) {
     /**
      * Restores default Android routing after Wi-Fi operations complete.
      */
-    fun unbindProcess() {
+    override fun unbindProcess() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 connectivityManager.bindProcessToNetwork(null)
@@ -233,7 +234,7 @@ class WifiManagerHelper(private val context: Context) {
      * Combines universal Cyberoam/Sophos appliance IPs, gateway IPs, DNS server IPs,
      * and campus subnet roots.
      */
-    fun getCandidatePortalUrls(primaryUrl: String? = null): List<String> {
+    override fun getCandidatePortalUrls(primaryUrl: String?): List<String> {
         val candidates = LinkedHashSet<String>()
 
         // 1. Primary candidate (if supplied)

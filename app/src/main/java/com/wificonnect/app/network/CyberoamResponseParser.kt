@@ -67,7 +67,7 @@ object CyberoamResponseParser {
         // Fast path 1: Instant match for LIVE status (bypasses heavy DOM parser for ~0.1ms speed)
         if (trimmed.contains("<status>LIVE</status>", ignoreCase = true) ||
             trimmed.contains("<status><![CDATA[LIVE]]></status>", ignoreCase = true)) {
-            val msg = extractCdataOrTag(trimmed, "message") ?: "Connected ✓"
+            val msg = extractCdataOrTag(trimmed, "message")?.takeIf { it.isNotBlank() } ?: "Connected ✓"
             return LoginResult.Success(msg, portalUrl)
         }
 

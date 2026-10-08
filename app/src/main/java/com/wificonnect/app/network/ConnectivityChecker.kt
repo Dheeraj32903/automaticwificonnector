@@ -9,8 +9,6 @@ import android.util.Log
 import com.wificonnect.app.model.InternetState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.net.HttpURLConnection
-import java.net.URL
 
 data class ConnectivityCheckResult(
     val state: InternetState,
@@ -21,19 +19,18 @@ data class ConnectivityCheckResult(
  * Checks actual Internet connectivity and dynamically discovers captive portal endpoints.
  * Captures live HTTP 302/307 redirect Location headers from the network firewall.
  */
-class ConnectivityChecker(private val context: Context) {
+class ConnectivityChecker(private val context: Context) : ConnectivityInspector {
 
     companion object {
         private const val TAG = "ConnectivityChecker"
         // Raw IP probes require ZERO DNS lookup and immediately trigger firewall interception
         private val PROBE_URLS = listOf(
             "http://1.1.1.1",
-            "http://8.8.8.8",
-            "http://neverssl.com",
             "http://connectivitycheck.gstatic.com/generate_204",
+            "http://neverssl.com",
+            "http://8.8.8.8",
             "http://captive.apple.com/hotspot-detect.html"
         )
-        private const val TIMEOUT_MS = 3000
     }
 
     private val connectivityManager: ConnectivityManager by lazy {
@@ -44,7 +41,7 @@ class ConnectivityChecker(private val context: Context) {
      * Checks internet connectivity and simultaneously discovers the active captive portal URL
      * directly from the router's HTTP interception redirect Location header.
      */
-    suspend fun checkConnectivityAndPortal(
+    override suspend fun checkConnectivityAndPortal(
         network: Network?,
         gatewayIp: String?
     ): ConnectivityCheckResult = withContext(Dispatchers.IO) {
@@ -59,7 +56,7 @@ class ConnectivityChecker(private val context: Context) {
             return@withContext ConnectivityCheckResult(InternetState.CONNECTED, null)
         }
 
-        // Fast-path 2: Probe candidate endpoints (raw IPs first to avoid DNS blocking)
+        // Fast-path 2: Probe candidate endpoints with standard client (raw IPs first to avoid DNS blocking)
         for (probeUrl in PROBE_URLS) {
             val result = probeUrlForInterception(network, probeUrl)
             if (result != null) {
@@ -74,11 +71,13 @@ class ConnectivityChecker(private val context: Context) {
         }
 
         // If interception was detected or network lacks validated Internet, return AUTHENTICATION_REQUIRED
-        ConnectivityCheckResult(InternetState.AUTHENTICATION_REQUIRED, null)
+        val fallbackPortal = gatewayIp?.let { "http://$it:8090" }
+        ConnectivityCheckResult(InternetState.AUTHENTICATION_REQUIRED, fallbackPortal)
     }
 
     private fun probeUrlForInterception(network: Network, testUrl: String): ConnectivityCheckResult? {
-        val client = OkHttpNetworkClient.getClient(network)
+        // Use standard client for public probes to adhere to standard Android TLS security
+        val client = OkHttpNetworkClient.getStandardClient(network)
         val request = okhttp3.Request.Builder()
             .url(testUrl)
             .header("User-Agent", "Mozilla/5.0 (Linux; Android) CaptiveProbe/3.0")
@@ -118,22 +117,46 @@ class ConnectivityChecker(private val context: Context) {
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "[Probe] Probe exception for $testUrl: ${e.message}")
+            Log.d(TAG, "[Probe] Probe exception for $testUrl: ${e.message}")
             null
         }
     }
 
     /**
-     * Checks Internet connectivity state.
+     * Checks Internet connectivity state with high efficiency.
      */
-    suspend fun checkInternetConnectivity(network: Network?): InternetState {
-        return checkConnectivityAndPortal(network, null).state
+    override suspend fun checkInternetConnectivity(network: Network?): InternetState = withContext(Dispatchers.IO) {
+        if (network == null) return@withContext InternetState.NO_INTERNET
+
+        // Fast-path: Check OS validated capability first
+        val caps = connectivityManager.getNetworkCapabilities(network)
+        if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+            return@withContext InternetState.CONNECTED
+        }
+
+        // Fast 204 check
+        val client = OkHttpNetworkClient.getStandardClient(network)
+        val request = okhttp3.Request.Builder()
+            .url("http://connectivitycheck.gstatic.com/generate_204")
+            .get()
+            .build()
+
+        try {
+            client.newCall(request).execute().use { resp ->
+                if (resp.code == 204) {
+                    return@withContext InternetState.CONNECTED
+                }
+            }
+        } catch (_: Exception) {}
+
+        // Fallback to general probe
+        checkConnectivityAndPortal(network, null).state
     }
 
     /**
      * Dynamically discovers captive portal base URL from live network redirect or gateway candidates.
      */
-    suspend fun detectCaptivePortalUrl(network: Network?, gatewayIp: String?): String? {
+    override suspend fun detectCaptivePortalUrl(network: Network?, gatewayIp: String?): String? {
         val result = checkConnectivityAndPortal(network, gatewayIp)
         return result.portalUrl ?: gatewayIp?.let { "http://$it:8090" }
     }
@@ -162,7 +185,6 @@ class ConnectivityChecker(private val context: Context) {
     private fun extractUrlFromHtml(html: String): String? {
         if (html.isBlank()) return null
         try {
-            // Check meta refresh
             val metaPattern = Regex("""<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"']+)["']""", RegexOption.IGNORE_CASE)
             val metaMatch = metaPattern.find(html)
             if (metaMatch != null) {
@@ -170,7 +192,6 @@ class ConnectivityChecker(private val context: Context) {
                 return extractBaseUrl(target)
             }
 
-            // Check form action
             val formPattern = Regex("""<form[^>]*action=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             val formMatch = formPattern.find(html)
             if (formMatch != null) {

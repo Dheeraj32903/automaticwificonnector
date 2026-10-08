@@ -7,16 +7,17 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.wificonnect.app.data.SecureCredentialStore
+import com.wificonnect.app.model.ConnectionFailureReason
+import com.wificonnect.app.model.ConnectionMetrics
+import com.wificonnect.app.model.ConnectionState
 import com.wificonnect.app.model.InternetState
-import com.wificonnect.app.model.LoginResult
 import com.wificonnect.app.model.UserCredentials
-import com.wificonnect.app.network.CaptivePortalLogin
 import com.wificonnect.app.network.ConnectivityChecker
+import com.wificonnect.app.network.ConnectionCoordinator
 import com.wificonnect.app.network.CyberoamCaptivePortalLogin
 import com.wificonnect.app.network.WifiManagerHelper
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -51,7 +52,9 @@ data class MainUiState(
     val statusType: StatusType = StatusType.IDLE,
     val isLoading: Boolean = false,
     val challengeUrl: String? = null,
-    val openCredentialsDialogEvent: Boolean = false
+    val openCredentialsDialogEvent: Boolean = false,
+    val metrics: ConnectionMetrics? = null,
+    val isFastPath: Boolean = false
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -63,41 +66,64 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val credentialStore = SecureCredentialStore(application)
     private val wifiHelper = WifiManagerHelper(application)
     private val connectivityChecker = ConnectivityChecker(application)
-    private val captivePortalLogin: CaptivePortalLogin = CyberoamCaptivePortalLogin()
+    private val captivePortalLogin = CyberoamCaptivePortalLogin()
 
-    // Flag to prevent auto-login loop when the user explicitly clicks DISCONNECT / LOGOUT
-    private var userExplicitlyLoggedOut = false
+    val connectionCoordinator = ConnectionCoordinator(
+        credentialStore = credentialStore,
+        wifiHelper = wifiHelper,
+        connectivityChecker = connectivityChecker,
+        captivePortalLogin = captivePortalLogin
+    )
 
     private val _uiState = MutableStateFlow(
-        MainUiState(autoLoginEnabled = credentialStore.isAutoLoginEnabled())
+        MainUiState(
+            hasCredentials = credentialStore.hasCredentials(),
+            savedUsername = credentialStore.getSavedUsername(),
+            autoLoginEnabled = credentialStore.isAutoLoginEnabled()
+        )
     )
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             Log.d(TAG, "[NetworkCallback] Wi-Fi network available")
-            // Reset explicit logout when connecting to a new network
-            userExplicitlyLoggedOut = false
-            viewModelScope.launch { refreshState() }
+            connectionCoordinator.onNetworkAvailable(
+                network = network,
+                coroutineScope = viewModelScope,
+                isAutoLoginEnabled = credentialStore.isAutoLoginEnabled()
+            )
         }
 
         override fun onLost(network: Network) {
             Log.d(TAG, "[NetworkCallback] Wi-Fi network lost")
-            viewModelScope.launch { refreshState() }
+            connectionCoordinator.onNetworkLost(network)
         }
 
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-            viewModelScope.launch { refreshState() }
+            // Android triggers capabilities changed on validation or transport updates
+            if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                _uiState.update {
+                    it.copy(
+                        internetState = InternetState.CONNECTED,
+                        internetStatusText = "Connected ✓"
+                    )
+                }
+            }
         }
 
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-            Log.d(TAG, "[NetworkCallback] Link properties changed (new gateway/IP)")
-            viewModelScope.launch { refreshState() }
+            Log.d(TAG, "[NetworkCallback] Link properties changed (gateway/DNS assigned)")
+            connectionCoordinator.onLinkPropertiesChanged(
+                network = network,
+                coroutineScope = viewModelScope,
+                isAutoLoginEnabled = credentialStore.isAutoLoginEnabled()
+            )
         }
     }
 
     init {
         registerNetworkCallback()
+        observeConnectionCoordinator()
         refreshState()
     }
 
@@ -115,76 +141,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Resolves the captive portal base URL for the active network.
-     * Prevents locking to a stale gateway IP when moving from Wi-Fi to Wi-Fi (e.g. Academic vs Hostel).
-     */
-    /**
-     * Resolves the captive portal base URL for the active network.
-     * Prevents locking to a stale gateway IP when moving from Wi-Fi to Wi-Fi (e.g. Academic vs Hostel).
-     */
-    private suspend fun resolvePortalUrl(
-        activeNetwork: Network?,
-        gatewayIp: String?,
-        savedPortal: String?,
-        ssid: String?
-    ): String? {
-        if (!savedPortal.isNullOrBlank()) {
-            val savedHost = try {
-                val uri = Uri.parse(if (savedPortal.startsWith("http://") || savedPortal.startsWith("https://")) savedPortal else "http://$savedPortal")
-                uri.host
-            } catch (_: Exception) {
-                null
-            }
-
-            // Check if savedPortal is an old gateway IP from a previous Wi-Fi network
-            val isIpv4 = savedHost != null && isIpv4Address(savedHost)
-            val isStaleGateway = isIpv4 && !gatewayIp.isNullOrBlank() && savedHost != gatewayIp
-
-            if (isStaleGateway) {
-                Log.i(TAG, "Saved portal $savedPortal is from a previous Wi-Fi gateway ($savedHost vs current $gatewayIp). Clearing stale IP and auto-detecting for current network.")
-                credentialStore.clearPortalUrl()
-            } else {
-                return savedPortal
-            }
-        }
-
-        // Check if there is an SSID-specific cached portal
-        if (!ssid.isNullOrBlank()) {
-            val cachedForSsid = credentialStore.getPortalUrlForSsid(ssid)
-            if (!cachedForSsid.isNullOrBlank()) {
-                return cachedForSsid
-            }
-        }
-
-        // Dynamic auto-detection for the current Wi-Fi network
-        val discovered = connectivityChecker.detectCaptivePortalUrl(activeNetwork, gatewayIp)
-        if (!discovered.isNullOrBlank()) {
-            return discovered
-        }
-
-        return gatewayIp?.let { "http://$it:8090" } ?: "http://172.16.16.16:8090"
-    }
-
-    private fun isIpv4Address(host: String): Boolean {
-        val parts = host.split(".")
-        if (parts.size != 4) return false
-        return parts.all { it.toIntOrNull() in 0..255 }
-    }
-
-    /**
-     * Checks current Wi-Fi and Internet status on app launch, resume, or network change.
-     * Executes fast 0ms portal discovery and triggers auto-login if enabled.
-     */
-    fun refreshState() {
+    private fun observeConnectionCoordinator() {
         viewModelScope.launch {
-            val isWifi = wifiHelper.isWifiConnected()
-            val hasCreds = credentialStore.hasCredentials()
-            val savedUser = credentialStore.getSavedUsername()
-            val isAutoLogin = credentialStore.isAutoLoginEnabled()
+            connectionCoordinator.connectionState.collect { state ->
+                applyConnectionState(state)
+            }
+        }
 
-            if (!isWifi) {
-                wifiHelper.unbindProcess()
+        viewModelScope.launch {
+            connectionCoordinator.latestMetrics.collect { metrics ->
+                if (metrics != null) {
+                    _uiState.update { it.copy(metrics = metrics) }
+                }
+            }
+        }
+    }
+
+    private fun applyConnectionState(state: ConnectionState) {
+        val hasCreds = credentialStore.hasCredentials()
+        val savedUser = credentialStore.getSavedUsername()
+        val autoLogin = credentialStore.isAutoLoginEnabled()
+
+        when (state) {
+            is ConnectionState.Disconnected -> {
                 _uiState.update {
                     it.copy(
                         wifiConnected = false,
@@ -194,7 +173,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         internetState = InternetState.NO_INTERNET,
                         hasCredentials = hasCreds,
                         savedUsername = savedUser,
-                        autoLoginEnabled = isAutoLogin,
+                        autoLoginEnabled = autoLogin,
                         statusMessage = "Please connect to Wi-Fi first.",
                         statusDetails = null,
                         statusType = StatusType.IDLE,
@@ -202,287 +181,254 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         challengeUrl = null
                     )
                 }
-                return@launch
             }
 
-            // Bind process to Wi-Fi to prevent Cellular / Mobile Data interference
-            wifiHelper.bindProcessToWifi()
+            is ConnectionState.WifiConnected -> {
+                val profile = credentialStore.getWifiProfile(state.ssid)
+                val isKnown = state.isKnown || (profile?.isKnown == true)
+                _uiState.update {
+                    it.copy(
+                        wifiConnected = true,
+                        ssid = state.ssid,
+                        wifiStatusText = "Connected ✓",
+                        portalUrl = profile?.portalUrl,
+                        internetStatusText = "Ready to connect",
+                        internetState = InternetState.AUTHENTICATION_REQUIRED,
+                        hasCredentials = hasCreds,
+                        savedUsername = savedUser,
+                        autoLoginEnabled = autoLogin,
+                        statusMessage = if (isKnown) "⚡ Known Wi-Fi: ${state.ssid}" else "Connected to ${state.ssid}",
+                        statusDetails = if (connectionCoordinator.userExplicitlyLoggedOut) "Session released. Tap CONNECT to log back in." else null,
+                        statusType = StatusType.READY,
+                        isLoading = false,
+                        isFastPath = isKnown
+                    )
+                }
+            }
 
-            val currentSsid = wifiHelper.getWifiSsid()
-            val activeNetwork = wifiHelper.getActiveWifiNetwork()
-            val gatewayIp = wifiHelper.getGatewayIp()
-            val savedPortal = credentialStore.getSavedPortalUrl()
+            is ConnectionState.IdentifyingNetwork -> {
+                _uiState.update {
+                    it.copy(
+                        wifiConnected = true,
+                        ssid = state.ssid,
+                        wifiStatusText = "Connected ✓",
+                        statusMessage = "Identifying network...",
+                        statusDetails = null,
+                        statusType = StatusType.CONNECTING,
+                        isLoading = true
+                    )
+                }
+            }
 
-            // Step 1: Preliminary portal URL
-            val preliminaryPortal = resolvePortalUrl(activeNetwork, gatewayIp, savedPortal, currentSsid)
+            is ConnectionState.Authenticating -> {
+                val msg = if (state.isFastPath) {
+                    "⚡ Authenticating (Fast-Path)..."
+                } else {
+                    "🔐 Authenticating (Attempt ${state.attempt})..."
+                }
+                _uiState.update {
+                    it.copy(
+                        wifiConnected = true,
+                        ssid = state.ssid,
+                        wifiStatusText = "Connected ✓",
+                        portalUrl = state.portalUrl,
+                        statusMessage = msg,
+                        statusDetails = state.portalUrl?.let { url -> "Endpoint: $url" },
+                        statusType = StatusType.CONNECTING,
+                        isLoading = true,
+                        isFastPath = state.isFastPath
+                    )
+                }
+            }
 
+            is ConnectionState.Authenticated -> {
+                val details = if (state.isFastPath) {
+                    "⚡ Fast-Path connected in ${state.authDurationMs}ms"
+                } else {
+                    "Authenticated in ${state.authDurationMs}ms"
+                }
+                _uiState.update {
+                    it.copy(
+                        wifiConnected = true,
+                        ssid = state.ssid,
+                        wifiStatusText = "Connected ✓",
+                        internetStatusText = "Connected ✓",
+                        internetState = InternetState.CONNECTED,
+                        portalUrl = state.portalUrl,
+                        statusMessage = "Connected ✓",
+                        statusDetails = details,
+                        statusType = StatusType.SUCCESS,
+                        isLoading = false,
+                        isFastPath = state.isFastPath
+                    )
+                }
+            }
+
+            is ConnectionState.Verifying -> {
+                _uiState.update {
+                    it.copy(
+                        wifiConnected = true,
+                        ssid = state.ssid,
+                        wifiStatusText = "Connected ✓",
+                        internetStatusText = "Connected ✓",
+                        internetState = InternetState.CONNECTED,
+                        portalUrl = state.portalUrl,
+                        statusMessage = "Connected ✓",
+                        statusDetails = "Verifying connection in background...",
+                        statusType = StatusType.SUCCESS,
+                        isLoading = false,
+                        isFastPath = state.isFastPath
+                    )
+                }
+            }
+
+            is ConnectionState.Connected -> {
+                val details = state.metrics?.formatSummary() ?: "Internet connected ✓"
+                _uiState.update {
+                    it.copy(
+                        wifiConnected = true,
+                        ssid = state.ssid,
+                        wifiStatusText = "Connected ✓",
+                        internetStatusText = "Connected ✓",
+                        internetState = InternetState.CONNECTED,
+                        portalUrl = state.portalUrl,
+                        statusMessage = "Connected ✓",
+                        statusDetails = details,
+                        statusType = StatusType.SUCCESS,
+                        isLoading = false,
+                        metrics = state.metrics,
+                        isFastPath = state.metrics?.isFastPath == true
+                    )
+                }
+            }
+
+            is ConnectionState.Failed -> {
+                handleFailureState(state)
+            }
+        }
+    }
+
+    private fun handleFailureState(state: ConnectionState.Failed) {
+        val (statusText, details, statusType, challenge) = when (val reason = state.reason) {
+            is ConnectionFailureReason.AuthFailed -> {
+                Tuple4("Invalid username or password.", reason.message, StatusType.ERROR_AUTH, null)
+            }
+            is ConnectionFailureReason.SessionLimit -> {
+                Tuple4("Login limit exceeded.", reason.details ?: reason.message, StatusType.ERROR_LIMIT, null)
+            }
+            is ConnectionFailureReason.ChallengeRequired -> {
+                Tuple4("Additional authentication required.", reason.message, StatusType.CHALLENGE, reason.challengeUrl)
+            }
+            is ConnectionFailureReason.PortalUnavailable -> {
+                Tuple4("Authentication portal unavailable.", reason.message, StatusType.ERROR_NETWORK, "http://neverssl.com")
+            }
+            is ConnectionFailureReason.NetworkChanged -> {
+                Tuple4("Network changed", "Wi-Fi connection changed.", StatusType.IDLE, null)
+            }
+            is ConnectionFailureReason.DiscoveryFailed -> {
+                Tuple4("Portal discovery failed.", reason.message, StatusType.ERROR_NETWORK, "http://neverssl.com")
+            }
+            is ConnectionFailureReason.VerificationFailed -> {
+                Tuple4("Verification failed.", reason.message, StatusType.ERROR_NETWORK, null)
+            }
+            is ConnectionFailureReason.Generic -> {
+                Tuple4(reason.message, null, StatusType.IDLE, null)
+            }
+        }
+
+        _uiState.update {
+            it.copy(
+                wifiConnected = wifiHelper.isWifiConnected(),
+                ssid = state.ssid,
+                statusMessage = statusText,
+                statusDetails = details,
+                statusType = statusType,
+                isLoading = false,
+                challengeUrl = challenge
+            )
+        }
+    }
+
+    private data class Tuple4<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
+
+    /**
+     * Checks current Wi-Fi status on resume or refresh button click.
+     */
+    fun refreshState() {
+        val isWifi = wifiHelper.isWifiConnected()
+        val hasCreds = credentialStore.hasCredentials()
+        val savedUser = credentialStore.getSavedUsername()
+        val autoLogin = credentialStore.isAutoLoginEnabled()
+
+        if (!isWifi) {
+            connectionCoordinator.onNetworkLost(null)
+            return
+        }
+
+        val network = wifiHelper.getActiveWifiNetwork()
+        if (network != null) {
+            connectionCoordinator.onNetworkAvailable(
+                network = network,
+                coroutineScope = viewModelScope,
+                isAutoLoginEnabled = autoLogin
+            )
+        } else {
+            val ssid = wifiHelper.getWifiSsid()
             _uiState.update {
                 it.copy(
                     wifiConnected = true,
-                    ssid = currentSsid,
+                    ssid = ssid,
                     wifiStatusText = "Connected ✓",
-                    portalUrl = preliminaryPortal,
-                    challengeUrl = preliminaryPortal,
-                    internetStatusText = "Checking...",
-                    internetState = InternetState.CHECKING,
                     hasCredentials = hasCreds,
                     savedUsername = savedUser,
-                    autoLoginEnabled = isAutoLogin,
+                    autoLoginEnabled = autoLogin,
+                    statusMessage = "Connected to $ssid",
+                    statusType = StatusType.READY,
                     isLoading = false
                 )
             }
-
-            // Step 2: Probe connectivity and simultaneously capture live redirect Location
-            val checkResult = connectivityChecker.checkConnectivityAndPortal(activeNetwork, gatewayIp)
-            val internet = checkResult.state
-            val liveDiscoveredPortal = checkResult.portalUrl
-
-            // If the live network firewall returned a portal redirect, that is ground truth!
-            val finalPortal = liveDiscoveredPortal ?: preliminaryPortal
-
-            if (!liveDiscoveredPortal.isNullOrBlank() && currentSsid.isNotBlank()) {
-                credentialStore.savePortalUrlForSsid(currentSsid, liveDiscoveredPortal)
-            }
-
-            val (netText, statusText, statusType) = when {
-                userExplicitlyLoggedOut && (internet == InternetState.AUTHENTICATION_REQUIRED || internet == InternetState.NO_INTERNET) -> {
-                    Triple("Logged Out", "Logged out successfully ✓", StatusType.IDLE)
-                }
-                internet == InternetState.CONNECTED -> Triple("Connected ✓", "Internet connected ✓", StatusType.SUCCESS)
-                internet == InternetState.AUTHENTICATION_REQUIRED -> Triple("Authentication Required", "Login required", StatusType.READY)
-                internet == InternetState.NO_INTERNET -> Triple("No Internet", "Login required", StatusType.READY)
-                else -> Triple("Checking...", "Checking...", StatusType.IDLE)
-            }
-
-            _uiState.update {
-                it.copy(
-                    internetStatusText = netText,
-                    internetState = internet,
-                    portalUrl = finalPortal,
-                    statusMessage = statusText,
-                    statusDetails = if (userExplicitlyLoggedOut && internet != InternetState.CONNECTED) "Session released. Tap CONNECT to reconnect." else null,
-                    statusType = statusType,
-                    challengeUrl = finalPortal
-                )
-            }
-
-            // Step 3: Fast Auto-Login when enabled and authentication is needed!
-            if (isAutoLogin && hasCreds && !_uiState.value.isLoading && !userExplicitlyLoggedOut &&
-                (internet == InternetState.AUTHENTICATION_REQUIRED || internet == InternetState.NO_INTERNET)) {
-                Log.i(TAG, "[AutoLogin] Auto-login triggered immediately upon Wi-Fi connection")
-                onConnectClicked()
-            }
         }
     }
 
     /**
-     * Executes the rapid CONNECT flow.
+     * Executes manual connect.
      */
     fun onConnectClicked() {
-        viewModelScope.launch {
-            if (_uiState.value.isLoading) return@launch
-            userExplicitlyLoggedOut = false
+        if (_uiState.value.isLoading) return
 
-            // STEP 1: Check Wi-Fi
-            if (!wifiHelper.isWifiConnected()) {
-                _uiState.update {
-                    it.copy(
-                        statusMessage = "Please connect to Wi-Fi first.",
-                        statusDetails = null,
-                        statusType = StatusType.IDLE
-                    )
-                }
-                return@launch
-            }
-
-            val activeNetwork = wifiHelper.getActiveWifiNetwork()
-
+        if (!wifiHelper.isWifiConnected()) {
             _uiState.update {
                 it.copy(
-                    isLoading = true,
-                    statusMessage = "Logging in...",
+                    statusMessage = "Please connect to Wi-Fi first.",
                     statusDetails = null,
-                    statusType = StatusType.CONNECTING
+                    statusType = StatusType.IDLE
                 )
             }
-
-            // STEP 2: If internet is already active, finish immediately
-            if (_uiState.value.internetState == InternetState.CONNECTED) {
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        internetStatusText = "Connected ✓",
-                        statusMessage = "Internet already connected ✓",
-                        statusDetails = null,
-                        statusType = StatusType.SUCCESS
-                    )
-                }
-                return@launch
-            }
-
-            // STEP 3: Retrieve saved credentials
-            if (!credentialStore.hasCredentials()) {
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        statusMessage = "Please save credentials first.",
-                        statusDetails = null,
-                        statusType = StatusType.READY,
-                        openCredentialsDialogEvent = true
-                    )
-                }
-                return@launch
-            }
-
-            val credentials = credentialStore.getCredentials()
-            if (credentials == null) {
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        statusMessage = "Failed to load credentials from secure storage.",
-                        statusDetails = null,
-                        statusType = StatusType.ERROR_AUTH
-                    )
-                }
-                return@launch
-            }
-
-            // STEP 4: Resolve portal endpoint dynamically for the current Wi-Fi network
-            val currentSsid = wifiHelper.getWifiSsid()
-            val savedPortal = credentialStore.getSavedPortalUrl()
-            val gatewayIp = wifiHelper.getGatewayIp()
-            val portalUrl = resolvePortalUrl(activeNetwork, gatewayIp, savedPortal, currentSsid)
-                ?: _uiState.value.portalUrl
-
-            // STEP 5: Fire captive portal credential login with candidate fallback list
-            val candidateUrls = wifiHelper.getCandidatePortalUrls(portalUrl)
-            val loginResult = captivePortalLogin.login(credentials, portalUrl, activeNetwork, candidateUrls)
-
-            // Cache discovered working portal URL for this SSID
-            val discoveredPortal = when (loginResult) {
-                is LoginResult.Success -> loginResult.portalUrl
-                is LoginResult.InvalidCredentials -> loginResult.portalUrl
-                is LoginResult.LimitExceeded -> loginResult.portalUrl
-                is LoginResult.ChallengeRequired -> loginResult.portalUrl
-                is LoginResult.UnknownError -> loginResult.portalUrl
-                else -> null
-            }
-            if (!discoveredPortal.isNullOrBlank()) {
-                credentialStore.savePortalUrlForSsid(currentSsid, discoveredPortal)
-                _uiState.update {
-                    it.copy(portalUrl = discoveredPortal, challengeUrl = discoveredPortal)
-                }
-            }
-
-            // STEP 6: Handle result instantly
-            when (loginResult) {
-                is LoginResult.Success -> {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            internetStatusText = "Connected ✓",
-                            statusMessage = "Connected ✓",
-                            statusDetails = loginResult.message.takeIf { m -> m != "Connected ✓" },
-                            statusType = StatusType.SUCCESS
-                        )
-                    }
-
-                    // Verify active Internet in the background asynchronously
-                    launch {
-                        val postInternet = connectivityChecker.checkInternetConnectivity(activeNetwork)
-                        if (postInternet == InternetState.CONNECTED) {
-                            _uiState.update {
-                                it.copy(internetStatusText = "Connected ✓")
-                            }
-                        }
-                    }
-                }
-
-                is LoginResult.InvalidCredentials -> {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            statusMessage = "Invalid username or password.",
-                            statusDetails = loginResult.message.takeIf { m -> m != "Invalid username or password." },
-                            statusType = StatusType.ERROR_AUTH
-                        )
-                    }
-                }
-
-                is LoginResult.LimitExceeded -> {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            statusMessage = "Login limit exceeded.",
-                            statusDetails = loginResult.details ?: loginResult.message,
-                            statusType = StatusType.ERROR_LIMIT
-                        )
-                    }
-                }
-
-                is LoginResult.ChallengeRequired -> {
-                    val targetUrl = loginResult.portalUrl ?: portalUrl ?: "http://neverssl.com"
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            statusMessage = "Additional authentication required.",
-                            statusDetails = loginResult.message,
-                            statusType = StatusType.CHALLENGE,
-                            challengeUrl = targetUrl
-                        )
-                    }
-                }
-
-                is LoginResult.PortalUnavailable -> {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            statusMessage = "Authentication portal unavailable.",
-                            statusDetails = "Could not reach login portal on $currentSsid. Tap 'Open Portal in Browser' to open manually.",
-                            statusType = StatusType.ERROR_NETWORK,
-                            challengeUrl = "http://neverssl.com"
-                        )
-                    }
-                }
-
-                is LoginResult.NetworkError -> {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            statusMessage = "Unable to connect to portal.",
-                            statusDetails = loginResult.message.takeIf { m -> m != "Unable to connect to the authentication portal." },
-                            statusType = StatusType.ERROR_NETWORK,
-                            challengeUrl = "http://neverssl.com"
-                        )
-                    }
-                }
-
-                is LoginResult.UnknownError -> {
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            statusMessage = "Login failed",
-                            statusDetails = loginResult.message.takeIf { m -> m != "Login failed" },
-                            statusType = StatusType.ERROR_AUTH
-                        )
-                    }
-                }
-            }
+            return
         }
+
+        if (!credentialStore.hasCredentials()) {
+            _uiState.update {
+                it.copy(
+                    statusMessage = "Please save credentials first.",
+                    statusDetails = null,
+                    statusType = StatusType.READY,
+                    openCredentialsDialogEvent = true
+                )
+            }
+            return
+        }
+
+        connectionCoordinator.connectManual(viewModelScope)
     }
 
     /**
-     * Logs out of captive portal to release active session and avoid limit exceeded issues.
+     * Executes logout.
      */
     fun onLogoutClicked() {
+        if (_uiState.value.isLoading) return
+
         viewModelScope.launch {
-            if (_uiState.value.isLoading) return@launch
-            val username = credentialStore.getSavedUsername() ?: return@launch
-            val activeNetwork = wifiHelper.getActiveWifiNetwork()
-            val portalUrl = _uiState.value.portalUrl
-
-            userExplicitlyLoggedOut = true
-
             _uiState.update {
                 it.copy(
                     isLoading = true,
@@ -492,8 +438,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
 
-            val success = captivePortalLogin.logout(username, portalUrl, activeNetwork)
-            Log.i(TAG, "[Logout] Portal session release completed (success: $success)")
+            connectionCoordinator.logout()
 
             _uiState.update {
                 it.copy(
@@ -520,7 +465,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Saves credentials into the Keystore-backed credential store.
+     * Saves credentials securely.
      */
     fun saveCredentials(username: String, password: String, customPortalUrl: String?) {
         val currentSsid = wifiHelper.getWifiSsid()
@@ -531,9 +476,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ssid = currentSsid
         )
         if (success) {
-            viewModelScope.launch {
-                refreshState()
+            _uiState.update {
+                it.copy(
+                    hasCredentials = true,
+                    savedUsername = username.trim()
+                )
             }
+            refreshState()
         }
     }
 

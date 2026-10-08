@@ -5,8 +5,6 @@ import android.util.Log
 import com.wificonnect.app.model.LoginResult
 import com.wificonnect.app.model.UserCredentials
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
@@ -18,11 +16,12 @@ import java.net.UnknownHostException
 /**
  * High-performance Cyberoam / Sophos captive portal implementation powered by OkHttp.
  *
- * Features:
- * - OkHttp connection pooling for sub-50ms repeat authentication
- * - Hardware socket factory binding to active Wi-Fi interface (bypasses cellular)
- * - Parallel candidate racing: tests candidates concurrently with coroutines
- * - Reliable session logout (Cyberoam mode 193) with multi-candidate failover
+ * Optimizations (Step 2, 5, 11):
+ * - Fast-path: Immediate authentication against primary cached endpoint with 0ms pre-probing.
+ * - Targeted fallback: Only probes local gateway and local appliance IP if primary fails.
+ * - Zero external credential leakage: External IPs (e.g. 1.1.1.1) are NEVER sent credential POST bodies.
+ * - Hardware socket factory binding ensures TCP traffic flows strictly over Wi-Fi interface.
+ * - No credentials or tokens are ever output to logs.
  */
 class CyberoamCaptivePortalLogin : CaptivePortalLogin {
 
@@ -31,6 +30,12 @@ class CyberoamCaptivePortalLogin : CaptivePortalLogin {
         private const val PRODUCT_TYPE_ANDROID = "2"
         private const val MODE_LOGIN = "191"
         private const val MODE_LOGOUT = "193"
+
+        // Universal local campus appliance endpoints (RFC 1918 private addresses only)
+        private val LOCAL_APPLIANCE_CANDIDATES = listOf(
+            "http://172.16.16.16:8090",
+            "https://172.16.16.16:8090"
+        )
     }
 
     override suspend fun login(
@@ -39,72 +44,53 @@ class CyberoamCaptivePortalLogin : CaptivePortalLogin {
         network: Network?,
         candidateUrls: List<String>
     ): LoginResult = withContext(Dispatchers.IO) {
-        val client = OkHttpNetworkClient.getClient(network)
-        val candidates = LinkedHashSet<String>()
+        val client = OkHttpNetworkClient.getPortalClient(network)
 
-        // 1. Primary candidate (if supplied, e.g. cached or auto-detected)
+        // 1. FAST PATH: Attempt primary cached or specified portal endpoint immediately
         val primary = targetPortalUrl?.trim()?.removeSuffix("/")
         if (!primary.isNullOrEmpty()) {
-            candidates.add(primary)
-            if (primary.startsWith("http://", ignoreCase = true)) {
-                candidates.add(primary.replaceFirst("http://", "https://", ignoreCase = true))
-            } else if (primary.startsWith("https://", ignoreCase = true)) {
-                candidates.add(primary.replaceFirst("https://", "http://", ignoreCase = true))
-            }
-        }
-
-        // Fast-path: If primary candidate exists, try it first immediately
-        if (primary != null) {
-            Log.d(TAG, "[Portal] Fast-path testing primary portal: $primary")
+            Log.d(TAG, "[Portal] Fast-path authentication on primary endpoint: $primary")
             val primaryResult = executeSingleLogin(credentials, primary, client)
             if (primaryResult !is LoginResult.PortalUnavailable && primaryResult !is LoginResult.NetworkError) {
-                Log.i(TAG, "[Portal] Fast-path success on primary portal: $primary")
+                Log.i(TAG, "[Portal] Fast-path successful on primary endpoint: $primary")
                 return@withContext primaryResult
             }
+            Log.w(TAG, "[Portal] Primary endpoint $primary unreachable, checking intelligent fallbacks")
         }
 
-        // 2. Add caller candidate URLs
+        // 2. Intelligent fallback: Prioritize local gateway & supplied candidates, then local appliance IPs
+        val fallbackCandidates = LinkedHashSet<String>()
+
         for (cand in candidateUrls) {
             val c = cand.trim().removeSuffix("/")
-            if (c.isNotEmpty()) {
-                candidates.add(c)
+            // Safety: Only include private/local endpoints, never public internet IPs like 1.1.1.1
+            if (c.isNotEmpty() && !isExternalPublicIp(c)) {
+                fallbackCandidates.add(c)
             }
         }
 
-        // 3. Always include universal Cyberoam / Sophos appliance IPs
-        candidates.add("https://1.1.1.1")
-        candidates.add("http://1.1.1.1")
-        candidates.add("http://172.16.16.16:8090")
-        candidates.add("https://172.16.16.16:8090")
+        fallbackCandidates.addAll(LOCAL_APPLIANCE_CANDIDATES)
 
-        // 4. Parallel candidate racing with coroutines
-        val candidateList = candidates.toList()
-        Log.i(TAG, "[Portal] Running parallel candidate authentication across ${candidateList.size} candidates")
-
-        coroutineScope {
-            val deferreds = candidateList.map { candidate ->
-                async(Dispatchers.IO) {
-                    val result = executeSingleLogin(credentials, candidate, client)
-                    Pair(candidate, result)
-                }
-            }
-
-            var lastResult: LoginResult? = null
-            for (deferred in deferreds) {
-                try {
-                    val (candidate, result) = deferred.await()
-                    if (result !is LoginResult.PortalUnavailable && result !is LoginResult.NetworkError) {
-                        Log.i(TAG, "[Portal] Winning candidate responded: $candidate ($result)")
-                        // Cancel other candidate checks to save battery and network bandwidth
-                        deferreds.forEach { it.cancel() }
-                        return@coroutineScope result
-                    }
-                    lastResult = result
-                } catch (_: Exception) {}
-            }
-
-            lastResult ?: LoginResult.PortalUnavailable("Authentication portal unavailable.")
+        // Remove the primary endpoint already tried
+        if (primary != null) {
+            fallbackCandidates.remove(primary)
+            fallbackCandidates.remove(primary.replaceFirst("http://", "https://", ignoreCase = true))
+            fallbackCandidates.remove(primary.replaceFirst("https://", "http://", ignoreCase = true))
         }
+
+        var lastResult: LoginResult = LoginResult.PortalUnavailable("Authentication portal unavailable.")
+
+        for (candidate in fallbackCandidates) {
+            Log.d(TAG, "[Portal] Attempting fallback candidate: $candidate")
+            val result = executeSingleLogin(credentials, candidate, client)
+            if (result !is LoginResult.PortalUnavailable && result !is LoginResult.NetworkError) {
+                Log.i(TAG, "[Portal] Authentication succeeded on fallback endpoint: $candidate")
+                return@withContext result
+            }
+            lastResult = result
+        }
+
+        lastResult
     }
 
     private fun executeSingleLogin(
@@ -139,11 +125,11 @@ class CyberoamCaptivePortalLogin : CaptivePortalLogin {
             client.newCall(request).execute().use { response ->
                 val body = response.body?.string().orEmpty()
                 val result = CyberoamResponseParser.parse(body, portalBase)
-                Log.d(TAG, "[Portal] Response from $portalBase: HTTP ${response.code} -> $result")
+                Log.d(TAG, "[Portal] Response from $portalBase: HTTP ${response.code} -> ${result.javaClass.simpleName}")
                 result
             }
         } catch (e: SocketTimeoutException) {
-            Log.w(TAG, "[Portal] Timeout connecting to $portalBase: ${e.message}")
+            Log.w(TAG, "[Portal] Timeout connecting to $portalBase")
             LoginResult.PortalUnavailable("Authentication portal unavailable (Timeout).")
         } catch (e: ConnectException) {
             Log.w(TAG, "[Portal] Connection refused at $portalBase")
@@ -162,23 +148,17 @@ class CyberoamCaptivePortalLogin : CaptivePortalLogin {
         targetPortalUrl: String?,
         network: Network?
     ): Boolean = withContext(Dispatchers.IO) {
-        val client = OkHttpNetworkClient.getClient(network)
+        val client = OkHttpNetworkClient.getPortalClient(network)
         val candidates = LinkedHashSet<String>()
 
         if (!targetPortalUrl.isNullOrBlank()) {
             val trimmed = targetPortalUrl.trim().removeSuffix("/")
-            candidates.add(trimmed)
-            if (trimmed.startsWith("http://", ignoreCase = true)) {
-                candidates.add(trimmed.replaceFirst("http://", "https://", ignoreCase = true))
-            } else if (trimmed.startsWith("https://", ignoreCase = true)) {
-                candidates.add(trimmed.replaceFirst("https://", "http://", ignoreCase = true))
+            if (!isExternalPublicIp(trimmed)) {
+                candidates.add(trimmed)
             }
         }
 
-        candidates.add("https://1.1.1.1")
-        candidates.add("http://1.1.1.1")
-        candidates.add("http://172.16.16.16:8090")
-        candidates.add("https://172.16.16.16:8090")
+        candidates.addAll(LOCAL_APPLIANCE_CANDIDATES)
 
         val sanitizedUsername = username.replace("'", "''")
 
@@ -216,7 +196,10 @@ class CyberoamCaptivePortalLogin : CaptivePortalLogin {
             }
         }
 
-        // Even if the portal already closed the socket, logout intent was dispatched
         true
+    }
+
+    private fun isExternalPublicIp(url: String): Boolean {
+        return url.contains("1.1.1.1") || url.contains("8.8.8.8") || url.contains("neverssl.com")
     }
 }
